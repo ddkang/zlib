@@ -15,8 +15,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
-#include "zlib.h"
 
+#include "zlib.h"
+#include "MemMgrAllocator.hh"
+#include "Seccomp.hh"
 #if defined(MSDOS) || defined(OS2) || defined(WIN32) || defined(__CYGWIN__)
 #  include <fcntl.h>
 #  include <io.h>
@@ -26,6 +28,7 @@
 #endif
 
 #define CHUNK 16384
+void * mem_mgr_opaque = NULL;
 
 /* Compress from file source to file dest until EOF on source.
    def() returns Z_OK on success, Z_MEM_ERROR if memory could not be
@@ -33,7 +36,7 @@
    level is supplied, Z_VERSION_ERROR if the version of zlib.h and the
    version of the library linked do not match, or Z_ERRNO if there is
    an error reading or writing the files. */
-int def(FILE *source, FILE *dest, int level)
+int def(int source, int dest, int level)
 {
     int ret, flush;
     unsigned have;
@@ -42,21 +45,28 @@ int def(FILE *source, FILE *dest, int level)
     unsigned char out[CHUNK];
 
     /* allocate deflate state */
-    strm.zalloc = Z_NULL;
-    strm.zfree = Z_NULL;
-    strm.opaque = Z_NULL;
+    strm.zalloc = Sirikata::MemMgrAllocatorMalloc;
+    strm.zfree = Sirikata::MemMgrAllocatorFree;
+    strm.opaque = mem_mgr_opaque;
     ret = deflateInit(&strm, level);
     if (ret != Z_OK)
         return ret;
-
+        if (!Sirikata::installStrictSyscallFilter(false)) {
+          abort();
+        }
     /* compress until end of file */
     do {
-        strm.avail_in = fread(in, 1, CHUNK, source);
-        if (ferror(source)) {
-            (void)deflateEnd(&strm);
-            return Z_ERRNO;
-        }
-        flush = feof(source) ? Z_FINISH : Z_NO_FLUSH;
+         auto status = read(source, in, CHUNK);
+	 if (status < 0) {
+	   if (errno == EINTR) {
+	     continue;
+	   } else {
+	     return Z_STREAM_ERROR;
+	   }
+	 }
+        strm.avail_in = status;
+
+        flush = status == 0 ? Z_FINISH : Z_NO_FLUSH;
         strm.next_in = in;
 
         /* run deflate() on input until output buffer not full, finish
@@ -67,9 +77,22 @@ int def(FILE *source, FILE *dest, int level)
             ret = deflate(&strm, flush);    /* no bad return value */
             assert(ret != Z_STREAM_ERROR);  /* state not clobbered */
             have = CHUNK - strm.avail_out;
-            if (fwrite(out, 1, have, dest) != have || ferror(dest)) {
+	    const unsigned char * tmp =out;
+	    while (have > 0) {
+	      auto status = write(dest, tmp, have);
+              if (status == 0) {
                 (void)deflateEnd(&strm);
                 return Z_ERRNO;
+              } else if (status < 0) {
+	      if (errno == EINTR) {
+	       continue;
+	      } else {
+		deflateEnd(&strm);
+		return Z_ERRNO;
+	      }
+	    }
+	    tmp += status;
+             have -= status;
             }
         } while (strm.avail_out == 0);
         assert(strm.avail_in == 0);     /* all input will be used */
@@ -89,7 +112,7 @@ int def(FILE *source, FILE *dest, int level)
    invalid or incomplete, Z_VERSION_ERROR if the version of zlib.h and
    the version of the library linked do not match, or Z_ERRNO if there
    is an error reading or writing the files. */
-int inf(FILE *source, FILE *dest)
+int inf(int source, int dest)
 {
     int ret;
     unsigned have;
@@ -98,22 +121,30 @@ int inf(FILE *source, FILE *dest)
     unsigned char out[CHUNK];
 
     /* allocate inflate state */
-    strm.zalloc = Z_NULL;
-    strm.zfree = Z_NULL;
-    strm.opaque = Z_NULL;
+    strm.zalloc = Sirikata::MemMgrAllocatorMalloc;
+    strm.zfree = Sirikata::MemMgrAllocatorFree;
+    strm.opaque = mem_mgr_opaque;
     strm.avail_in = 0;
     strm.next_in = Z_NULL;
     ret = inflateInit(&strm);
     if (ret != Z_OK)
         return ret;
+    if (!Sirikata::installStrictSyscallFilter(false)) {
+      abort();
+    }
 
     /* decompress until deflate stream ends or end of file */
     do {
-        strm.avail_in = fread(in, 1, CHUNK, source);
-        if (ferror(source)) {
-            (void)inflateEnd(&strm);
-            return Z_ERRNO;
-        }
+        ssize_t status = read(source, in, CHUNK);
+	if (status < 0) {
+	  if (errno == EINTR) {
+	    continue;
+	  }
+	  (void)inflateEnd(&strm);
+	  return Z_ERRNO;
+	}
+        strm.avail_in = status;
+	  
         if (strm.avail_in == 0)
             break;
         strm.next_in = in;
@@ -133,10 +164,24 @@ int inf(FILE *source, FILE *dest)
                 return ret;
             }
             have = CHUNK - strm.avail_out;
-            if (fwrite(out, 1, have, dest) != have || ferror(dest)) {
-                (void)inflateEnd(&strm);
-                return Z_ERRNO;
-            }
+	    const unsigned char *tmp = out;
+	    do {
+	      ssize_t status = write(dest, tmp, have);
+	      if (status <0) {
+		if (errno == EINTR) {
+		  continue;
+		} else {
+		  (void)inflateEnd(&strm);
+		  return Z_ERRNO;		  
+		}
+	      } else if (status == 0) {
+		  (void)inflateEnd(&strm);
+		  return Z_ERRNO;		  
+	      } else {
+		tmp += status;
+		have -= status;
+	      }
+            } while(have > 0);
         } while (strm.avail_out == 0);
 
         /* done when inflate() says it's done */
@@ -176,25 +221,26 @@ void zerr(int ret)
 int main(int argc, char **argv)
 {
     int ret;
-
+    mem_mgr_opaque = Sirikata::MemMgrAllocatorInit(16 * 1024 * 1024, 0, 0, 16, false);
     /* avoid end-of-line conversions */
     SET_BINARY_MODE(stdin);
     SET_BINARY_MODE(stdout);
 
     /* do compression if no arguments */
     if (argc == 1) {
-        ret = def(stdin, stdout, Z_DEFAULT_COMPRESSION);
+        ret = def(0, 1, 9);
         if (ret != Z_OK)
-            zerr(ret);
+	  zerr(ret);
+        syscall(60, ret);
         return ret;
     }
 
     /* do decompression if -d specified */
     else if (argc == 2 && strcmp(argv[1], "-d") == 0) {
-        ret = inf(stdin, stdout);
+        ret = inf(0, 1);
         if (ret != Z_OK)
             zerr(ret);
-        return ret;
+        syscall(60, ret);
     }
 
     /* otherwise, report usage */
