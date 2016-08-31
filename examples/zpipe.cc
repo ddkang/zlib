@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <unistd.h>
 
 #include "zlib.h"
 #include "MemMgrAllocator.hh"
@@ -226,26 +227,42 @@ int main(int argc, char **argv)
     SET_BINARY_MODE(stdin);
     SET_BINARY_MODE(stdout);
 
-    /* do compression if no arguments */
-    if (argc == 1) {
-        ret = def(0, 1, 9);
-        if (ret != Z_OK)
-	  zerr(ret);
-        syscall(60, ret);
-        return ret;
+    int c, quality = 9;
+    bool decomp = false;
+    while ((c = getopt (argc, argv, "hdq:")) != -1) {
+        switch(c) {
+            case 'd':
+                decomp = true;
+                break;
+            case 'q':
+                quality = std::stoi(std::string(optarg));
+                break;
+            case '?':
+                if (optopt == 'q')
+                    fputs("quality argument requires parameter", stderr);
+                break;
+            case 'h':
+            default:
+                fputs("zpipe usage: zpipe [-q [1-9]] [-d] < source > dest", stderr);
+                return 1;
+        }
+    }
+    if (quality > 9 || quality < 1) {
+        fputs("zpipe usage: zpipe [-q [1-9]] [-d] < source > dest", stderr);
+        return 1;
     }
 
-    /* do decompression if -d specified */
-    else if (argc == 2 && strcmp(argv[1], "-d") == 0) {
+    /* do compression if not decompressing */
+    if (!decomp) {
+        ret = def(0, 1, quality);
+        if (ret != Z_OK)
+          zerr(ret);
+        syscall(60, ret);
+        return ret;
+    } else { /* otherwise decompress */
         ret = inf(0, 1);
         if (ret != Z_OK)
             zerr(ret);
         syscall(60, ret);
-    }
-
-    /* otherwise, report usage */
-    else {
-        fputs("zpipe usage: zpipe [-d] < source > dest\n", stderr);
-        return 1;
     }
 }
